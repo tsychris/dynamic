@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Training artifacts
+checkpoints_adv/
+checkpoints_pnv/
+*.pt
+*.pth
+*.ckpt
+
+# TensorBoard and experiment outputs
+tb_runs/
+vis_examples/
+vis_occlusion/
+vis_pt/
+
+# Local editor and OS files
+.DS_Store
+*.swp
+*.swo
