@@ -39,10 +39,10 @@ def parse_args() -> argparse.Namespace:
         help="Generator checkpoint used to synthesize dirty queries for all compared models. Defaults to adv checkpoint.",
     )
     parser.add_argument(
-        "--ratios",
+        "--box-counts",
         type=str,
-        default="0.1,0.2,0.3,0.4,0.5",
-        help="Comma-separated dirty drop ratios.",
+        default="1,2,3,4,5",
+        help="Comma-separated dirty active box counts.",
     )
     parser.add_argument("--topk", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -82,30 +82,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_ratios(raw: str) -> list[float]:
-    ratios: list[float] = []
+def parse_box_counts(raw: str) -> list[int]:
+    counts: list[int] = []
     for token in raw.split(","):
         token = token.strip()
         if not token:
             continue
-        ratio = float(token)
-        if not (0.0 < ratio < 1.0):
-            raise ValueError(f"Dirty ratio must be in (0, 1), got {ratio}")
-        ratios.append(ratio)
-    if not ratios:
-        raise ValueError("No valid dirty ratios parsed.")
-    return ratios
+        count = int(token)
+        if count < 1:
+            raise ValueError(f"Dirty active box count must be >= 1, got {count}")
+        counts.append(count)
+    if not counts:
+        raise ValueError("No valid dirty active box counts parsed.")
+    return counts
 
 
-def ratio_tag(ratio: float) -> str:
-    return f"p{int(round(ratio * 100.0)):02d}"
+def box_count_tag(count: int) -> str:
+    return f"b{int(count):02d}"
 
 
 def build_command(
     args: argparse.Namespace,
     checkpoint: str,
     dirty_generator_checkpoint: str,
-    dirty_ratio: float,
+    dirty_active_boxes: int,
     save_json: Path,
 ) -> list[str]:
     cmd = [
@@ -137,8 +137,8 @@ def build_command(
         args.device,
         "--min-time-gap",
         str(args.min_time_gap),
-        "--dirty-drop-ratio",
-        str(dirty_ratio),
+        "--dirty-active-boxes",
+        str(dirty_active_boxes),
         "--save-json",
         str(save_json),
     ]
@@ -168,7 +168,7 @@ def load_result(path: Path) -> dict:
 
 def main() -> None:
     args = parse_args()
-    ratios = parse_ratios(args.ratios)
+    box_counts = parse_box_counts(args.box_counts)
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -181,9 +181,9 @@ def main() -> None:
 
     summary_rows: list[dict[str, object]] = []
 
-    for dirty_ratio in ratios:
+    for dirty_active_boxes in box_counts:
         for model_name, checkpoint in model_specs:
-            out_json = save_dir / f"{args.prefix}_{model_name}_{ratio_tag(dirty_ratio)}.json"
+            out_json = save_dir / f"{args.prefix}_{model_name}_{box_count_tag(dirty_active_boxes)}.json"
             if args.skip_existing and out_json.exists():
                 print(f"[INFO] Skip existing: {out_json}")
             else:
@@ -191,7 +191,7 @@ def main() -> None:
                     args=args,
                     checkpoint=checkpoint,
                     dirty_generator_checkpoint=dirty_generator_checkpoint,
-                    dirty_ratio=dirty_ratio,
+                    dirty_active_boxes=dirty_active_boxes,
                     save_json=out_json,
                 )
                 print("[RUN]", " ".join(cmd))
@@ -204,10 +204,11 @@ def main() -> None:
                 "model": model_name,
                 "checkpoint": checkpoint,
                 "dirty_generator_checkpoint": dirty_generator_checkpoint,
-                "dirty_drop_ratio": dirty_ratio,
+                "dirty_active_boxes": dirty_active_boxes,
                 "dirty_point_weight": payload.get("dirty_point_weight"),
                 "dirty_geom_weight": payload.get("dirty_geom_weight"),
-                "actual_drop_ratio_mean": dirty_stats.get("actual_drop_ratio_mean"),
+                "actual_active_boxes_mean": dirty_stats.get("actual_active_boxes_mean"),
+                "actual_occluded_fraction_mean": dirty_stats.get("actual_occluded_fraction_mean"),
                 "object_insertion": dirty_stats.get("object_insertion"),
                 "num_evaluated": result.get("num_evaluated"),
                 "recall_at_1": result.get("recall_at_1"),
@@ -219,7 +220,7 @@ def main() -> None:
             }
             summary_rows.append(row)
             print(
-                f"[SUMMARY] model={model_name} ratio={dirty_ratio:.2f} "
+                f"[SUMMARY] model={model_name} active_boxes={dirty_active_boxes} "
                 f"R@1={100.0 * float(row['recall_at_1']):.2f}% "
                 f"R@5={100.0 * float(row['recall_at_5']):.2f}% "
                 f"R@10={100.0 * float(row['recall_at_10']):.2f}%"
@@ -238,10 +239,11 @@ def main() -> None:
                 "model",
                 "checkpoint",
                 "dirty_generator_checkpoint",
-                "dirty_drop_ratio",
+                "dirty_active_boxes",
                 "dirty_point_weight",
                 "dirty_geom_weight",
-                "actual_drop_ratio_mean",
+                "actual_active_boxes_mean",
+                "actual_occluded_fraction_mean",
                 "object_insertion",
                 "num_evaluated",
                 "recall_at_1",

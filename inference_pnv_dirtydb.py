@@ -56,16 +56,16 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint that provides generator weights for dirty query/db synthesis. Defaults to --checkpoint.",
     )
     parser.add_argument(
-        "--query-dirty-drop-ratio",
-        type=float,
-        default=0.3,
-        help="Exact fraction of query points to occlude with the generator.",
+        "--query-dirty-active-boxes",
+        type=int,
+        default=None,
+        help="Use a fixed number of active occlusion boxes per query. Defaults to random [1, num_boxes].",
     )
     parser.add_argument(
-        "--db-dirty-drop-ratio",
-        type=float,
+        "--db-dirty-active-boxes",
+        type=int,
         default=None,
-        help="Exact fraction of db points to occlude with the generator. Defaults to query ratio.",
+        help="Use a fixed number of active occlusion boxes per db item. Defaults to query setting.",
     )
     parser.add_argument(
         "--no-query-object-insertion",
@@ -226,7 +226,7 @@ def extract_embeddings(
     num_workers: int,
     device: torch.device,
     dirty_generator: AdversarialOcclusionGenerator | None = None,
-    dirty_drop_ratio: float = 0.3,
+    dirty_active_boxes: int | None = None,
     dirty_object_insertion: bool = True,
     desc: str = "Extract embeddings",
 ) -> tuple[np.ndarray, List[int], Dict[str, float] | None]:
@@ -242,22 +242,25 @@ def extract_embeddings(
     key_order: List[int] = []
     feats = None
     dirty_stats = None
-    dirty_drop_acc = 0.0
+    dirty_occluded_acc = 0.0
+    dirty_active_box_acc = 0.0
     dirty_batches = 0
     with torch.no_grad():
         for points, labels in tqdm(loader, desc=desc):
             points = points.to(device, non_blocking=True)
             model_input = points
             if dirty_generator is not None:
-                drop_ratios = torch.full(
-                    (points.shape[0],),
-                    float(dirty_drop_ratio),
-                    device=device,
-                    dtype=points.dtype,
-                )
+                active_box_counts = None
+                if dirty_active_boxes is not None:
+                    active_box_counts = torch.full(
+                        (points.shape[0],),
+                        int(dirty_active_boxes),
+                        device=device,
+                        dtype=torch.long,
+                    )
                 occl = dirty_generator(
                     points,
-                    drop_ratios=drop_ratios,
+                    active_box_counts=active_box_counts,
                     generate_insertion=dirty_object_insertion,
                 )
                 model_input = apply_hard_drop_and_insert(
@@ -265,7 +268,8 @@ def extract_embeddings(
                     hard_drop_mask=occl.hard_drop_mask,
                     inserted_points_xyz=occl.inserted_points if dirty_object_insertion else None,
                 )
-                dirty_drop_acc += float(occl.hard_drop_mask.mean().item())
+                dirty_occluded_acc += float(occl.hard_drop_mask.mean().item())
+                dirty_active_box_acc += float(occl.active_box_counts.float().mean().item())
                 dirty_batches += 1
 
             emb = model(model_input).detach().cpu().numpy().astype(np.float32)
@@ -280,8 +284,9 @@ def extract_embeddings(
         raise RuntimeError("No embedding extracted.")
     if dirty_generator is not None:
         dirty_stats = {
-            "target_drop_ratio": float(dirty_drop_ratio),
-            "actual_drop_ratio_mean": float(dirty_drop_acc / max(dirty_batches, 1)),
+            "requested_active_boxes": None if dirty_active_boxes is None else int(dirty_active_boxes),
+            "actual_active_boxes_mean": float(dirty_active_box_acc / max(dirty_batches, 1)),
+            "actual_occluded_fraction_mean": float(dirty_occluded_acc / max(dirty_batches, 1)),
             "object_insertion": bool(dirty_object_insertion),
         }
     return feats, key_order, dirty_stats
@@ -426,15 +431,15 @@ def main() -> None:
     dirty_geom_weight = float(
         dirty_saved_args.get("geom_weight", 2.0) if args.dirty_geom_weight is None else args.dirty_geom_weight
     )
-    db_dirty_drop_ratio = (
-        float(args.db_dirty_drop_ratio)
-        if args.db_dirty_drop_ratio is not None
-        else float(args.query_dirty_drop_ratio)
+    db_dirty_active_boxes = (
+        int(args.db_dirty_active_boxes)
+        if args.db_dirty_active_boxes is not None
+        else args.query_dirty_active_boxes
     )
     print(
         f"[INFO] dirty_query=True dirty_db=True generator_ckpt={dirty_generator_ckpt} "
-        f"query_drop_ratio={args.query_dirty_drop_ratio:.2f} "
-        f"db_drop_ratio={db_dirty_drop_ratio:.2f} "
+        f"query_active_boxes={args.query_dirty_active_boxes if args.query_dirty_active_boxes is not None else 'random'} "
+        f"db_active_boxes={db_dirty_active_boxes if db_dirty_active_boxes is not None else 'random'} "
         f"query_object_insertion={query_dirty_object_insertion} "
         f"db_object_insertion={db_dirty_object_insertion} "
         f"point_weight={dirty_point_weight:.3f} geom_weight={dirty_geom_weight:.3f}"
@@ -470,7 +475,7 @@ def main() -> None:
         num_workers=args.num_workers,
         device=device,
         dirty_generator=dirty_generator,
-        dirty_drop_ratio=args.query_dirty_drop_ratio,
+        dirty_active_boxes=args.query_dirty_active_boxes,
         dirty_object_insertion=query_dirty_object_insertion,
         desc="Extract dirty query embeddings",
     )
@@ -481,7 +486,7 @@ def main() -> None:
         num_workers=args.num_workers,
         device=device,
         dirty_generator=dirty_generator,
-        dirty_drop_ratio=db_dirty_drop_ratio,
+        dirty_active_boxes=db_dirty_active_boxes,
         dirty_object_insertion=db_dirty_object_insertion,
         desc="Extract dirty db embeddings",
     )
@@ -489,11 +494,13 @@ def main() -> None:
     print(f"[INFO] DB features: {db_features.shape}")
     if dirty_stats is not None:
         print(
-            f"[INFO] dirty_query actual_drop_ratio_mean={dirty_stats['actual_drop_ratio_mean']:.4f}"
+            f"[INFO] dirty_query actual_active_boxes_mean={dirty_stats['actual_active_boxes_mean']:.4f} "
+            f"actual_occluded_fraction_mean={dirty_stats['actual_occluded_fraction_mean']:.4f}"
         )
     if db_dirty_stats is not None:
         print(
-            f"[INFO] dirty_db actual_drop_ratio_mean={db_dirty_stats['actual_drop_ratio_mean']:.4f}"
+            f"[INFO] dirty_db actual_active_boxes_mean={db_dirty_stats['actual_active_boxes_mean']:.4f} "
+            f"actual_occluded_fraction_mean={db_dirty_stats['actual_occluded_fraction_mean']:.4f}"
         )
 
     result = compute_recall(

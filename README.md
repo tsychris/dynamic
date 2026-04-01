@@ -4,7 +4,7 @@
 
 - `min_f max_G L_place(f(G(x)))`
 - `G` 不是随机点 dropout，而是生成“车辆样式”遮挡
-- 严格硬约束 dropout 比例（支持 10/20/30/40/50%）
+- 每个样本随机启用若干个 box，删除被这些 box 几何遮挡到的点
 
 ## 设计要点
 
@@ -17,9 +17,9 @@
 - `inside-box`：点在盒体内部
 - `shadow-cone`：点落在盒体角域后方（模拟被动态物体遮挡）
 
-3. 叠加 learned per-point score 后，用 `top-k` 做硬预算投影：
-- 每帧精确丢弃 `k = ratio * N` 个点
-- `straight-through` 估计器支持对 `G` 反向传播
+3. 每个样本随机激活 `num_box in [1, num_boxes]` 个 box：
+- 凡是落在激活 box 内部或其遮挡锥后的点都会被删除
+- 用 threshold + `straight-through` 估计器支持对 `G` 反向传播
 
 4. 可选 object insertion：
 - 在生成盒体表面采样点，插入到被删除位置，模拟动态目标回波
@@ -64,7 +64,7 @@ python dynamic/train_kitti.py \
 - `query-file` 用训练查询 pickle（通常在 `/TIEVNAS/jyf/KITTI`）
 - 点云 `.bin` 会优先从 `--kitti-root=/TIEVNAS/KITTI` 读取
 - descriptor 默认是 `PointNetVLAD`
-- 训练是 `min_f max_G` 的对抗遮挡训练（含硬预算 drop）
+- 训练是 `min_f max_G` 的对抗遮挡训练（随机 active boxes）
 
 ## KITTI Dataloader
 
@@ -111,7 +111,7 @@ python dynamic/test_recall_kitti.py --device cpu --num-workers 0 --max-elems 64 
 
 可选参数：
 
-- `--no-object-insertion`: 关闭对象插入，只做遮挡 dropout
+- `--no-object-insertion`: 关闭对象插入，只做遮挡删除
 - `--p-classes`, `--k-samples`: 控制 PK batch 采样
 - `--size-prior-weight`, `--height-prior-weight`: 控制 realism 正则强度
 
@@ -119,5 +119,5 @@ python dynamic/test_recall_kitti.py --device cpu --num-workers 0 --max-elems 64 
 
 1. 用你自己的 `descriptor network f` 替换 `PointNetDescriptor`
 2. 用你自己的 metric loss / contrastive loss 替换 triplet loss
-3. 先从 `ratio in {0.1, 0.2, 0.3}` 开始，再扩展到 `0.4, 0.5`
+3. 先从较小的 active box 数开始，例如 `1~3`，再扩展到更多 box
 4. 监控 clean recall 与 dynamic recall，避免 `G` 过强导致 clean 性能下降

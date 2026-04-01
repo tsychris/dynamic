@@ -34,8 +34,8 @@ DEFAULT_FALLBACK_ROOT = "/TIEVNAS/jyf/KITTI"
 
 @dataclass
 class OcclusionCase:
-    target_drop_ratio: float
-    actual_drop_ratio: float
+    active_box_count: int
+    actual_occluded_fraction: float
     kept_points_xyz: np.ndarray
     dropped_points_xyz: np.ndarray
     inserted_points_xyz: np.ndarray | None
@@ -45,19 +45,19 @@ class OcclusionCase:
     cosine_similarity: float | None
 
 
-def parse_ratio_list(raw: str) -> list[float]:
-    ratios: list[float] = []
+def parse_box_count_list(raw: str, max_boxes: int) -> list[int]:
+    counts: list[int] = []
     for token in raw.replace(";", ",").split(","):
         token = token.strip()
         if not token:
             continue
-        ratio = float(token)
-        if not (0.0 < ratio < 1.0):
-            raise ValueError(f"drop ratio must be in (0, 1), got {ratio}")
-        ratios.append(ratio)
-    if not ratios:
-        raise ValueError("At least one drop ratio is required.")
-    return ratios
+        count = int(token)
+        if not (1 <= count <= max_boxes):
+            raise ValueError(f"active box count must be in [1, {max_boxes}], got {count}")
+        counts.append(count)
+    if not counts:
+        raise ValueError("At least one active box count is required.")
+    return counts
 
 
 def infer_generator_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int]:
@@ -261,14 +261,14 @@ def compute_descriptor_similarity(
     descriptor: torch.nn.Module | None,
     generator: AdversarialOcclusionGenerator,
     model_points: torch.Tensor,
-    drop_ratio: float,
+    active_box_count: int,
     use_object_insertion: bool,
 ) -> float | None:
     if descriptor is None:
         return None
     clean_emb = descriptor(model_points)
-    ratio_tensor = torch.tensor([drop_ratio], device=model_points.device, dtype=model_points.dtype)
-    occl = generator(model_points, drop_ratios=ratio_tensor, generate_insertion=use_object_insertion)
+    active_box_counts = torch.tensor([active_box_count], device=model_points.device, dtype=torch.long)
+    occl = generator(model_points, active_box_counts=active_box_counts, generate_insertion=use_object_insertion)
     adv_points = apply_hard_drop_and_insert(
         points=model_points,
         hard_drop_mask=occl.hard_drop_mask,
@@ -283,7 +283,7 @@ def build_occlusion_cases(
     descriptor: torch.nn.Module | None,
     vis_points: np.ndarray,
     model_points: np.ndarray,
-    drop_ratios: Sequence[float],
+    active_box_counts: Sequence[int],
     device: torch.device,
     use_object_insertion: bool,
 ) -> list[OcclusionCase]:
@@ -292,9 +292,9 @@ def build_occlusion_cases(
     cases: list[OcclusionCase] = []
 
     with torch.inference_mode():
-        for ratio in drop_ratios:
-            ratio_tensor = torch.tensor([ratio], device=device, dtype=vis_tensor.dtype)
-            occl = generator(vis_tensor, drop_ratios=ratio_tensor, generate_insertion=use_object_insertion)
+        for active_box_count in active_box_counts:
+            active_box_tensor = torch.tensor([active_box_count], device=device, dtype=torch.long)
+            occl = generator(vis_tensor, active_box_counts=active_box_tensor, generate_insertion=use_object_insertion)
             hard_mask = occl.hard_drop_mask[0] > 0.5
 
             vis_xyz = vis_tensor[0, :, :3]
@@ -310,14 +310,14 @@ def build_occlusion_cases(
                 descriptor=descriptor,
                 generator=generator,
                 model_points=model_tensor,
-                drop_ratio=ratio,
+                active_box_count=active_box_count,
                 use_object_insertion=use_object_insertion,
             )
 
             cases.append(
                 OcclusionCase(
-                    target_drop_ratio=float(ratio),
-                    actual_drop_ratio=float(occl.hard_drop_mask[0].float().mean().item()),
+                    active_box_count=int(active_box_count),
+                    actual_occluded_fraction=float(occl.hard_drop_mask[0].float().mean().item()),
                     kept_points_xyz=kept_points_xyz,
                     dropped_points_xyz=dropped_points_xyz,
                     inserted_points_xyz=inserted_points_xyz,
@@ -381,7 +381,7 @@ def save_visualization_figure(
             scatter_xy(bev_ax, inserted_plot, INSERT_COLOR, "inserted", size=2.0)
         for center, size, yaw in zip(case.centers, case.sizes, case.yaws):
             draw_box_bev(bev_ax, center=center, size=size, yaw=float(yaw), color=BOX_COLOR)
-        title = f"BEV drop={case.target_drop_ratio:.2f}\nactual={case.actual_drop_ratio:.3f}"
+        title = f"BEV boxes={case.active_box_count}\noccluded={case.actual_occluded_fraction:.3f}"
         if case.cosine_similarity is not None:
             title += f" cos={case.cosine_similarity:.3f}"
         bev_ax.set_title(title)
@@ -398,7 +398,7 @@ def save_visualization_figure(
             scatter_xz(xz_ax, inserted_plot, INSERT_COLOR, "inserted", size=2.0)
         for center, size, yaw in zip(case.centers, case.sizes, case.yaws):
             draw_box_xz(xz_ax, center=center, size=size, yaw=float(yaw), color=BOX_COLOR)
-        xz_ax.set_title(f"X-Z drop={case.target_drop_ratio:.2f}")
+        xz_ax.set_title(f"X-Z boxes={case.active_box_count}")
         xz_ax.set_xlim(*xlim)
         xz_ax.set_ylim(*zlim)
         xz_ax.set_xlabel("x (m)")
@@ -441,8 +441,8 @@ def save_summary_json(
     for case in cases:
         summary["cases"].append(
             {
-                "target_drop_ratio": float(case.target_drop_ratio),
-                "actual_drop_ratio": float(case.actual_drop_ratio),
+                "active_box_count": int(case.active_box_count),
+                "actual_occluded_fraction": float(case.actual_occluded_fraction),
                 "num_removed_points": int(case.dropped_points_xyz.shape[0]),
                 "num_kept_points": int(case.kept_points_xyz.shape[0]),
                 "num_inserted_points": int(0 if case.inserted_points_xyz is None else case.inserted_points_xyz.shape[0]),
@@ -462,7 +462,7 @@ def save_summary_json(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize learned KITTI adversarial occlusion boxes and removed points under different drop ratios."
+        description="Visualize learned KITTI adversarial occlusion boxes and removed points under different active-box counts."
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to an adversarial training checkpoint.")
     parser.add_argument(
@@ -475,7 +475,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback-root", type=str, default=None, help="Override fallback KITTI root.")
     parser.add_argument("--sample-index", type=int, default=0, help="Dataset-local index used when --query-key is not set.")
     parser.add_argument("--query-key", type=int, default=None, help="Original query key from the pickle file.")
-    parser.add_argument("--ratios", type=str, default="0.1,0.2,0.3,0.4,0.5", help="Comma-separated drop ratios.")
+    parser.add_argument(
+        "--box-counts",
+        type=str,
+        default=None,
+        help="Comma-separated active occlusion box counts. Defaults to 1..min(num_boxes, 5).",
+    )
     parser.add_argument(
         "--vis-num-points",
         type=int,
@@ -534,7 +539,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    drop_ratios = parse_ratio_list(args.ratios)
     device = resolve_device(args.device)
     ckpt: dict[str, Any] | None = None
     ckpt_args: dict[str, Any] = {}
@@ -618,12 +622,17 @@ def main() -> None:
     generator.to(device)
     generator.eval()
 
+    raw_box_counts = args.box_counts
+    if raw_box_counts is None:
+        raw_box_counts = ",".join(str(v) for v in range(1, min(num_boxes, 5) + 1))
+    active_box_counts = parse_box_count_list(raw_box_counts, max_boxes=num_boxes)
+
     cases = build_occlusion_cases(
         generator=generator,
         descriptor=descriptor,
         vis_points=vis_points,
         model_points=model_points,
-        drop_ratios=drop_ratios,
+        active_box_counts=active_box_counts,
         device=device,
         use_object_insertion=not args.no_object_insertion,
     )
@@ -632,7 +641,7 @@ def main() -> None:
         Path(__file__).resolve().parent
         / "vis_occlusion"
         / ("random_init" if checkpoint_path is None else checkpoint_path.stem)
-        / f"query_{query_key:06d}_ratios.png"
+        / f"query_{query_key:06d}_boxes.png"
     )
     out_path = Path(args.out_path).expanduser().resolve() if args.out_path is not None else default_out_path
     json_path = out_path.with_suffix(".json")
@@ -663,8 +672,8 @@ def main() -> None:
     print(f"[INFO] point_weight={point_weight:.3f} geom_weight={geom_weight:.3f}")
     for case in cases:
         msg = (
-            f"[INFO] ratio={case.target_drop_ratio:.2f} "
-            f"actual={case.actual_drop_ratio:.3f} "
+            f"[INFO] active_boxes={case.active_box_count} "
+            f"occluded={case.actual_occluded_fraction:.3f} "
             f"removed={case.dropped_points_xyz.shape[0]}"
         )
         if case.cosine_similarity is not None:

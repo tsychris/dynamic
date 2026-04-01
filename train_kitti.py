@@ -22,6 +22,7 @@ from occlusion_generator import (
     AdversarialOcclusionGenerator,
     apply_hard_drop_and_insert,
     apply_soft_drop,
+    sample_active_box_counts,
 )
 
 VIS_PT_ROOT = Path("/media/autolab/tsy/dynamic/vis_pt")
@@ -63,18 +64,18 @@ def add_tensorboard_custom_layout(writer: SummaryWriter) -> None:
             ],
         },
         "Occlusion": {
-            "Drop Ratio": [
+            "Occluded Fraction": [
                 "Multiline",
                 [
-                    "train_iter/drop_ratio",
-                    "train_iter/target_drop_ratio",
+                    "train_iter/occluded_fraction",
+                    "train_epoch/occluded_fraction",
                 ],
             ],
-            "Epoch Drop Ratio": [
+            "Active Boxes": [
                 "Multiline",
                 [
-                    "train_epoch/drop_ratio",
-                    "train_epoch/target_drop_ratio",
+                    "train_iter/active_num_boxes",
+                    "train_epoch/active_num_boxes",
                 ],
             ],
         },
@@ -329,12 +330,6 @@ class TrainConfig:
     height_prior_weight: float = 0.05
     range_prior_weight: float = 0.05
     use_object_insertion: bool = True
-    drop_ratio_set: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5)
-
-
-def sample_drop_ratios(batch: int, ratio_set: tuple[float, ...], device: torch.device) -> torch.Tensor:
-    ratios = [ratio_set[random.randrange(len(ratio_set))] for _ in range(batch)]
-    return torch.tensor(ratios, device=device, dtype=torch.float32)
 
 
 def _resolve_record_asset(
@@ -679,8 +674,8 @@ def train_one_epoch(
         "loss_place_clean": 0.0,
         "loss_place_adv": 0.0,
         "loss_consistency": 0.0,
-        "drop_ratio": 0.0,
-        "target_drop_ratio": 0.0,
+        "occluded_fraction": 0.0,
+        "active_num_boxes": 0.0,
         "reg_size_prior": 0.0,
         "reg_height_prior": 0.0,
         "reg_range_prior": 0.0,
@@ -690,13 +685,17 @@ def train_one_epoch(
         points = points.to(device, non_blocking=True)
         positives_mask = positives_mask.to(device, non_blocking=True)
         negatives_mask = negatives_mask.to(device, non_blocking=True)
-        drop_ratios = sample_drop_ratios(points.shape[0], cfg.drop_ratio_set, device)
+        active_box_counts = sample_active_box_counts(
+            batch=points.shape[0],
+            max_boxes=generator.num_boxes,
+            device=device,
+        )
 
         # (1) maximize_G L_place(f(G(x)))
         set_requires_grad(descriptor, False)
         set_requires_grad(generator, True)
 
-        occl = generator(points, drop_ratios=drop_ratios, generate_insertion=False)
+        occl = generator(points, active_box_counts=active_box_counts, generate_insertion=False)
         adv_points_for_g = apply_soft_drop(points, occl.st_drop_mask)
         emb_adv = descriptor(adv_points_for_g)
         loss_place_adv = masked_batch_hard_triplet_loss(
@@ -725,7 +724,7 @@ def train_one_epoch(
         with torch.no_grad():
             occl_detach = generator(
                 points,
-                drop_ratios=drop_ratios,
+                active_box_counts=active_box_counts,
                 generate_insertion=cfg.use_object_insertion,
             )
             adv_points_for_f = apply_hard_drop_and_insert(
@@ -749,8 +748,8 @@ def train_one_epoch(
                 title=(
                     f"epoch={epoch} step={global_step} "
                     f"query_key={query_key} "
-                    f"target_drop={float(drop_ratios[0].item()):.2f} "
-                    f"actual_drop={float(occl_detach.hard_drop_mask[0].mean().item()):.2f}"
+                    f"active_boxes={int(occl_detach.active_box_counts[0].item())} "
+                    f"occluded={float(occl_detach.hard_drop_mask[0].mean().item()):.2f}"
                 ),
             )
             if VIS_PT_DISABLED_REASON is not None:
@@ -784,8 +783,8 @@ def train_one_epoch(
             meter["loss_place_clean"] += float(loss_clean.item())
             meter["loss_place_adv"] += float(loss_adv.item())
             meter["loss_consistency"] += float(loss_cons.item())
-            meter["drop_ratio"] += float(occl_detach.hard_drop_mask.mean().item())
-            meter["target_drop_ratio"] += float(drop_ratios.mean().item())
+            meter["occluded_fraction"] += float(occl_detach.hard_drop_mask.mean().item())
+            meter["active_num_boxes"] += float(occl_detach.active_box_counts.float().mean().item())
             meter["reg_size_prior"] += float(reg_size_prior.item())
             meter["reg_height_prior"] += float(reg_height_prior.item())
             meter["reg_range_prior"] += float(reg_range_prior.item())
@@ -799,8 +798,16 @@ def train_one_epoch(
             writer.add_scalar("train_iter/loss_place_clean", float(loss_clean.item()), global_step)
             writer.add_scalar("train_iter/loss_place_adv", float(loss_adv.item()), global_step)
             writer.add_scalar("train_iter/loss_consistency", float(loss_cons.item()), global_step)
-            writer.add_scalar("train_iter/drop_ratio", float(occl_detach.hard_drop_mask.mean().item()), global_step)
-            writer.add_scalar("train_iter/target_drop_ratio", float(drop_ratios.mean().item()), global_step)
+            writer.add_scalar(
+                "train_iter/occluded_fraction",
+                float(occl_detach.hard_drop_mask.mean().item()),
+                global_step,
+            )
+            writer.add_scalar(
+                "train_iter/active_num_boxes",
+                float(occl_detach.active_box_counts.float().mean().item()),
+                global_step,
+            )
             writer.add_scalar("train_iter/reg_size_prior", float(reg_size_prior.item()), global_step)
             writer.add_scalar("train_iter/reg_height_prior", float(reg_height_prior.item()), global_step)
             writer.add_scalar("train_iter/reg_range_prior", float(reg_range_prior.item()), global_step)
@@ -996,7 +1003,8 @@ def main() -> None:
                 f"clean={stats['loss_place_clean']:.4f} "
                 f"adv={stats['loss_place_adv']:.4f} "
                 f"cons={stats['loss_consistency']:.4f} "
-                f"drop={stats['drop_ratio']:.3f}"
+                f"occluded={stats['occluded_fraction']:.3f} "
+                f"boxes={stats['active_num_boxes']:.2f}"
             )
 
             writer.add_scalar("train_epoch/loss_f", stats["loss_f"], epoch)
@@ -1004,8 +1012,8 @@ def main() -> None:
             writer.add_scalar("train_epoch/loss_place_clean", stats["loss_place_clean"], epoch)
             writer.add_scalar("train_epoch/loss_place_adv", stats["loss_place_adv"], epoch)
             writer.add_scalar("train_epoch/loss_consistency", stats["loss_consistency"], epoch)
-            writer.add_scalar("train_epoch/drop_ratio", stats["drop_ratio"], epoch)
-            writer.add_scalar("train_epoch/target_drop_ratio", stats["target_drop_ratio"], epoch)
+            writer.add_scalar("train_epoch/occluded_fraction", stats["occluded_fraction"], epoch)
+            writer.add_scalar("train_epoch/active_num_boxes", stats["active_num_boxes"], epoch)
             writer.add_scalar("train_epoch/reg_size_prior", stats["reg_size_prior"], epoch)
             writer.add_scalar("train_epoch/reg_height_prior", stats["reg_height_prior"], epoch)
             writer.add_scalar("train_epoch/reg_range_prior", stats["reg_range_prior"], epoch)

@@ -12,24 +12,46 @@ def _angle_wrap(x: torch.Tensor) -> torch.Tensor:
     return torch.atan2(torch.sin(x), torch.cos(x))
 
 
-def _hard_topk_mask(
-    scores: torch.Tensor,
-    drop_ratios: torch.Tensor,
-    temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def sample_active_box_counts(
+    batch: int,
+    max_boxes: int,
+    device: torch.device,
+    min_boxes: int = 1,
+) -> torch.Tensor:
+    if max_boxes < 1:
+        raise ValueError(f"max_boxes must be >= 1, got {max_boxes}")
+    min_boxes = max(1, min(int(min_boxes), int(max_boxes)))
+    return torch.randint(min_boxes, max_boxes + 1, (int(batch),), device=device, dtype=torch.long)
+
+
+def _sample_active_box_mask(active_box_counts: torch.Tensor, num_boxes: int) -> torch.Tensor:
     """
-    Project soft scores into an exact top-k hard mask for each sample.
+    Randomly pick exactly k active boxes for each sample.
     """
-    bsz, npts = scores.shape
-    soft = torch.sigmoid(scores / max(temperature, 1e-4))
-    hard = torch.zeros_like(scores)
+    if num_boxes < 1:
+        raise ValueError(f"num_boxes must be >= 1, got {num_boxes}")
+
+    counts = active_box_counts.to(dtype=torch.long)
+    counts = counts.clamp(1, num_boxes)
+    bsz = int(counts.shape[0])
+    active = torch.zeros((bsz, num_boxes), device=counts.device, dtype=torch.bool)
 
     for b in range(bsz):
-        k = int(torch.round(drop_ratios[b] * npts).clamp(1, npts - 1).item())
-        idx = torch.topk(scores[b], k=k, dim=-1).indices
-        hard[b, idx] = 1.0
+        perm = torch.randperm(num_boxes, device=counts.device)
+        active[b, perm[: int(counts[b].item())]] = True
 
-    # Straight-through estimator: forward sees hard, backward follows soft.
+    return active
+
+
+def _straight_through_threshold(
+    soft_scores: torch.Tensor,
+    threshold: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Forward uses a hard thresholded mask, backward follows the soft scores.
+    """
+    soft = soft_scores.clamp(0.0, 1.0)
+    hard = (soft >= float(threshold)).to(dtype=soft.dtype)
     st = hard - soft.detach() + soft
     return hard, st, soft
 
@@ -46,7 +68,7 @@ def _decode_box_params(
     return centers, sizes, yaws
 
 
-def _box_shadow_scores(
+def _box_shadow_scores_per_box(
     points_xyz: torch.Tensor,
     centers: torch.Tensor,
     sizes: torch.Tensor,
@@ -105,11 +127,22 @@ def _box_shadow_scores(
     behind = torch.sigmoid((rp - (rc + 0.5 * sizes[:, None, :, 0])) * sharpness)
     shadow_score = in_theta * in_phi * behind
 
-    per_box_score = torch.maximum(inside_score, shadow_score)  # [B, N, M]
-    fused = per_box_score.max(dim=2).values  # [B, N]
     if nbox == 0:
-        return torch.zeros((bsz, npts), device=points_xyz.device, dtype=points_xyz.dtype)
-    return fused
+        return torch.zeros((bsz, npts, 0), device=points_xyz.device, dtype=points_xyz.dtype)
+    return torch.maximum(inside_score, shadow_score)  # [B, N, M]
+
+
+def _fuse_active_box_scores(
+    per_box_scores: torch.Tensor,
+    active_box_mask: torch.Tensor,
+) -> torch.Tensor:
+    if per_box_scores.ndim != 3:
+        raise ValueError(f"Expected per_box_scores [B, N, M], got {tuple(per_box_scores.shape)}")
+    if active_box_mask.ndim != 2:
+        raise ValueError(f"Expected active_box_mask [B, M], got {tuple(active_box_mask.shape)}")
+
+    masked_scores = per_box_scores * active_box_mask[:, None, :].to(dtype=per_box_scores.dtype)
+    return masked_scores.max(dim=2).values
 
 
 def _box_surface_template(points_per_box: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -176,7 +209,28 @@ def sample_inserted_points(
     rot_z = z
 
     world = torch.stack([rot_x, rot_y, rot_z], dim=-1) + centers[:, :, None, :]
-    return world.reshape(bsz, nbox * points_per_box, 3)
+    return world
+
+
+def _pack_active_inserted_points(
+    box_surface_points: torch.Tensor,
+    active_box_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Pack active box surface samples to the front so insertion only uses active boxes.
+    """
+    if box_surface_points.ndim != 4:
+        raise ValueError(f"Expected box_surface_points [B, M, K, 3], got {tuple(box_surface_points.shape)}")
+
+    bsz, nbox, points_per_box, _ = box_surface_points.shape
+    packed = box_surface_points.new_zeros((bsz, nbox * points_per_box, 3))
+    for b in range(bsz):
+        active_idx = torch.nonzero(active_box_mask[b], as_tuple=False).squeeze(-1)
+        if active_idx.numel() == 0:
+            continue
+        selected = box_surface_points[b, active_idx].reshape(-1, 3)
+        packed[b, : selected.shape[0]] = selected
+    return packed
 
 
 def apply_soft_drop(points: torch.Tensor, drop_mask: torch.Tensor) -> torch.Tensor:
@@ -226,6 +280,8 @@ class OcclusionOutput:
     soft_drop_mask: torch.Tensor
     scores: torch.Tensor
     geom_scores: torch.Tensor
+    active_box_counts: torch.Tensor
+    active_box_mask: torch.Tensor
     centers: torch.Tensor
     sizes: torch.Tensor
     yaws: torch.Tensor
@@ -237,8 +293,8 @@ class AdversarialOcclusionGenerator(nn.Module):
     """
     Generator for dynamic occlusion:
     - predicts vehicle-like cuboids;
-    - computes occlusion scores from geometry + learned per-point scores;
-    - enforces exact dropout ratio with hard top-k projection.
+    - randomly activates a subset of the predicted cuboids per sample;
+    - removes every point geometrically occluded by the active cuboids.
     """
 
     def __init__(
@@ -289,24 +345,32 @@ class AdversarialOcclusionGenerator(nn.Module):
     def forward(
         self,
         points: torch.Tensor,
-        drop_ratios: torch.Tensor,
+        active_box_counts: torch.Tensor | None = None,
         generate_insertion: bool = True,
     ) -> OcclusionOutput:
         """
         points: [B, N, C], first 3 dims are xyz.
-        drop_ratios: [B], expected in [0, 1], typically sampled from {0.1..0.5}.
+        active_box_counts: [B], random count of active boxes in [1, num_boxes].
         """
         xyz = points[..., 0:3]
-        bsz, npts, _ = xyz.shape
+        bsz, _, _ = xyz.shape
 
-        if drop_ratios.ndim == 0:
-            drop_ratios = drop_ratios.unsqueeze(0).repeat(bsz)
-        drop_ratios = drop_ratios.to(points.device, dtype=points.dtype)
-        drop_ratios = drop_ratios.clamp(0.01, 0.95)
+        if active_box_counts is None:
+            active_box_counts = sample_active_box_counts(
+                batch=bsz,
+                max_boxes=self.num_boxes,
+                device=points.device,
+            )
+        elif active_box_counts.ndim == 0:
+            active_box_counts = active_box_counts.unsqueeze(0).repeat(bsz)
+        active_box_counts = active_box_counts.to(device=points.device, dtype=torch.long).clamp(1, self.num_boxes)
+
+        active_box_fraction = active_box_counts.to(dtype=points.dtype) / float(self.num_boxes)
+        active_box_mask = _sample_active_box_mask(active_box_counts=active_box_counts, num_boxes=self.num_boxes)
 
         point_feat = self.point_mlp(xyz)  # [B, N, F]
         global_feat = point_feat.max(dim=1).values  # [B, F]
-        cond = self.global_mlp(torch.cat([global_feat, drop_ratios[:, None]], dim=-1))  # [B, 128]
+        cond = self.global_mlp(torch.cat([global_feat, active_box_fraction[:, None]], dim=-1))  # [B, 128]
 
         raw_box = self.box_head(cond).view(bsz, self.num_boxes, 7)
         centers, sizes, yaws = _decode_box_params(
@@ -316,30 +380,34 @@ class AdversarialOcclusionGenerator(nn.Module):
             max_box_size=self.max_box_size.to(points.dtype),
         )
 
-        geom_scores = _box_shadow_scores(
+        per_box_geom_scores = _box_shadow_scores_per_box(
             points_xyz=xyz,
             centers=centers,
             sizes=sizes,
             yaws=yaws,
         )
+        geom_scores = self.geom_weight * _fuse_active_box_scores(
+            per_box_scores=per_box_geom_scores,
+            active_box_mask=active_box_mask,
+        )
+        geom_scores = geom_scores.clamp(0.0, 1.0)
 
-        cond_expand = cond[:, None, :].expand(-1, npts, -1)
-        point_logits = self.point_head(torch.cat([point_feat, cond_expand], dim=-1)).squeeze(-1)
-        scores = self.point_weight * point_logits + self.geom_weight * geom_scores
-
-        hard, st, soft = _hard_topk_mask(
-            scores=scores,
-            drop_ratios=drop_ratios,
-            temperature=self.temperature,
+        hard, st, soft = _straight_through_threshold(
+            soft_scores=geom_scores,
+            threshold=0.5,
         )
 
         inserted_points = None
         if generate_insertion:
-            inserted_points = sample_inserted_points(
+            box_surface_points = sample_inserted_points(
                 centers=centers,
                 sizes=sizes,
                 yaws=yaws,
                 points_per_box=self.points_per_box,
+            )
+            inserted_points = _pack_active_inserted_points(
+                box_surface_points=box_surface_points,
+                active_box_mask=active_box_mask,
             )
 
         regularization = self._regularization(centers=centers, sizes=sizes)
@@ -348,8 +416,10 @@ class AdversarialOcclusionGenerator(nn.Module):
             hard_drop_mask=hard,
             st_drop_mask=st,
             soft_drop_mask=soft,
-            scores=scores,
+            scores=geom_scores,
             geom_scores=geom_scores,
+            active_box_counts=active_box_counts,
+            active_box_mask=active_box_mask,
             centers=centers,
             sizes=sizes,
             yaws=yaws,

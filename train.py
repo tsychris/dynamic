@@ -15,6 +15,7 @@ from occlusion_generator import (
     AdversarialOcclusionGenerator,
     apply_hard_drop_and_insert,
     apply_soft_drop,
+    sample_active_box_counts,
 )
 
 
@@ -120,12 +121,6 @@ class TrainConfig:
     height_prior_weight: float = 0.05
     range_prior_weight: float = 0.05
     use_object_insertion: bool = True
-    drop_ratio_set: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5)
-
-
-def sample_drop_ratios(batch: int, ratio_set: tuple[float, ...], device: torch.device) -> torch.Tensor:
-    ratios = [ratio_set[random.randrange(len(ratio_set))] for _ in range(batch)]
-    return torch.tensor(ratios, device=device, dtype=torch.float32)
 
 
 def train_one_epoch(
@@ -145,19 +140,24 @@ def train_one_epoch(
         "loss_g": 0.0,
         "loss_place_clean": 0.0,
         "loss_place_adv": 0.0,
-        "drop_ratio": 0.0,
+        "occluded_fraction": 0.0,
+        "active_num_boxes": 0.0,
     }
 
     for points, labels in loader:
         points = points.to(device)
         labels = labels.to(device)
-        drop_ratios = sample_drop_ratios(labels.shape[0], cfg.drop_ratio_set, device)
+        active_box_counts = sample_active_box_counts(
+            batch=labels.shape[0],
+            max_boxes=generator.num_boxes,
+            device=device,
+        )
 
         # (1) maximize_G L_place(f(G(x)))
         set_requires_grad(descriptor, False)
         set_requires_grad(generator, True)
 
-        occl = generator(points, drop_ratios=drop_ratios, generate_insertion=False)
+        occl = generator(points, active_box_counts=active_box_counts, generate_insertion=False)
         adv_points_for_g = apply_soft_drop(points, occl.st_drop_mask)
         emb_adv = descriptor(adv_points_for_g)
         loss_place_adv = batch_hard_triplet_loss(emb_adv, labels, margin=cfg.margin)
@@ -179,7 +179,7 @@ def train_one_epoch(
         with torch.no_grad():
             occl_detach = generator(
                 points,
-                drop_ratios=drop_ratios,
+                active_box_counts=active_box_counts,
                 generate_insertion=cfg.use_object_insertion,
             )
             adv_points_for_f = apply_hard_drop_and_insert(
@@ -205,7 +205,8 @@ def train_one_epoch(
             meter["loss_g"] += float(loss_g.item())
             meter["loss_place_clean"] += float(loss_clean.item())
             meter["loss_place_adv"] += float(loss_adv.item())
-            meter["drop_ratio"] += float(occl_detach.hard_drop_mask.mean().item())
+            meter["occluded_fraction"] += float(occl_detach.hard_drop_mask.mean().item())
+            meter["active_num_boxes"] += float(occl_detach.active_box_counts.float().mean().item())
 
     num_iter = max(len(loader), 1)
     for k in meter:
@@ -303,7 +304,8 @@ def main() -> None:
             f"loss_g={stats['loss_g']:.4f} "
             f"clean={stats['loss_place_clean']:.4f} "
             f"adv={stats['loss_place_adv']:.4f} "
-            f"drop={stats['drop_ratio']:.3f}"
+            f"occluded={stats['occluded_fraction']:.3f} "
+            f"boxes={stats['active_num_boxes']:.2f}"
         )
 
     ckpt = {
