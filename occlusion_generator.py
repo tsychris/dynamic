@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+DEFAULT_FIXED_BOX_SIZE = (3.0, 1.5, 1.0)
+
 
 def _angle_wrap(x: torch.Tensor) -> torch.Tensor:
     return torch.atan2(torch.sin(x), torch.cos(x))
@@ -61,9 +63,13 @@ def _decode_box_params(
     scene_extent_xyz: torch.Tensor,
     min_box_size: torch.Tensor,
     max_box_size: torch.Tensor,
+    fixed_box_size: tuple[float, float, float] | None = DEFAULT_FIXED_BOX_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     centers = torch.tanh(raw_box[..., 0:3]) * scene_extent_xyz
-    sizes = min_box_size + torch.sigmoid(raw_box[..., 3:6]) * (max_box_size - min_box_size)
+    if fixed_box_size is None:
+        sizes = min_box_size + torch.sigmoid(raw_box[..., 3:6]) * (max_box_size - min_box_size)
+    else:
+        sizes = raw_box.new_tensor(fixed_box_size).view(*([1] * (raw_box.ndim - 1)), 3).expand(*raw_box.shape[:-1], 3)
     yaws = torch.tanh(raw_box[..., 6]) * torch.pi
     return centers, sizes, yaws
 
@@ -308,6 +314,7 @@ class AdversarialOcclusionGenerator(nn.Module):
         scene_extent_xyz: tuple[float, float, float] = (40.0, 40.0, 3.0),
         min_box_size: tuple[float, float, float] = (2.5, 1.5, 1.2),
         max_box_size: tuple[float, float, float] = (6.5, 2.8, 3.0),
+        fixed_box_size: tuple[float, float, float] | None = DEFAULT_FIXED_BOX_SIZE,
     ) -> None:
         super().__init__()
         self.num_boxes = num_boxes
@@ -315,6 +322,7 @@ class AdversarialOcclusionGenerator(nn.Module):
         self.temperature = temperature
         self.point_weight = point_weight
         self.geom_weight = geom_weight
+        self.fixed_box_size = None if fixed_box_size is None else tuple(float(v) for v in fixed_box_size)
 
         self.register_buffer("scene_extent_xyz", torch.tensor(scene_extent_xyz).float())
         self.register_buffer("min_box_size", torch.tensor(min_box_size).float())
@@ -399,6 +407,7 @@ class AdversarialOcclusionGenerator(nn.Module):
             scene_extent_xyz=self.scene_extent_xyz.to(points.dtype),
             min_box_size=self.min_box_size.to(points.dtype),
             max_box_size=self.max_box_size.to(points.dtype),
+            fixed_box_size=self.fixed_box_size,
         )
 
         per_box_geom_scores = _box_shadow_scores_per_box(
@@ -452,8 +461,11 @@ class AdversarialOcclusionGenerator(nn.Module):
         """
         Keep generated boxes in realistic dynamic-object ranges.
         """
-        nominal = self.nominal_car_size.to(device=sizes.device, dtype=sizes.dtype).view(1, 1, 3).expand_as(sizes)
-        size_prior = F.smooth_l1_loss(sizes, nominal)
+        if self.fixed_box_size is None:
+            nominal = self.nominal_car_size.to(device=sizes.device, dtype=sizes.dtype).view(1, 1, 3).expand_as(sizes)
+            size_prior = F.smooth_l1_loss(sizes, nominal)
+        else:
+            size_prior = sizes.new_zeros(())
 
         # Keep objects near drivable vertical band.
         height_prior = ((centers[..., 2] + 1.0) ** 2).mean()
