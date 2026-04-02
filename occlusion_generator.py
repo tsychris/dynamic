@@ -346,27 +346,48 @@ class AdversarialOcclusionGenerator(nn.Module):
         self,
         points: torch.Tensor,
         active_box_counts: torch.Tensor | None = None,
+        active_box_mask: torch.Tensor | None = None,
         generate_insertion: bool = True,
     ) -> OcclusionOutput:
         """
         points: [B, N, C], first 3 dims are xyz.
         active_box_counts: [B], random count of active boxes in [1, num_boxes].
+        active_box_mask: [B, M], optional explicit active-box selection.
         """
         xyz = points[..., 0:3]
         bsz, _, _ = xyz.shape
 
-        if active_box_counts is None:
+        if active_box_counts is None and active_box_mask is None:
             active_box_counts = sample_active_box_counts(
                 batch=bsz,
                 max_boxes=self.num_boxes,
                 device=points.device,
             )
-        elif active_box_counts.ndim == 0:
+        elif active_box_counts is not None and active_box_counts.ndim == 0:
             active_box_counts = active_box_counts.unsqueeze(0).repeat(bsz)
-        active_box_counts = active_box_counts.to(device=points.device, dtype=torch.long).clamp(1, self.num_boxes)
+
+        if active_box_mask is not None:
+            if active_box_mask.ndim == 1:
+                active_box_mask = active_box_mask.unsqueeze(0)
+            active_box_mask = active_box_mask.to(device=points.device, dtype=torch.bool)
+            if active_box_mask.shape != (bsz, self.num_boxes):
+                raise ValueError(
+                    f"Expected active_box_mask shape {(bsz, self.num_boxes)}, got {tuple(active_box_mask.shape)}"
+                )
+            inferred_counts = active_box_mask.sum(dim=1)
+            if torch.any(inferred_counts < 1):
+                raise ValueError("active_box_mask must activate at least one box per sample.")
+            inferred_counts = inferred_counts.to(dtype=torch.long)
+            if active_box_counts is not None:
+                active_box_counts = active_box_counts.to(device=points.device, dtype=torch.long).clamp(1, self.num_boxes)
+                if not torch.equal(active_box_counts, inferred_counts):
+                    raise ValueError("active_box_counts does not match the provided active_box_mask.")
+            active_box_counts = inferred_counts
+        else:
+            active_box_counts = active_box_counts.to(device=points.device, dtype=torch.long).clamp(1, self.num_boxes)
+            active_box_mask = _sample_active_box_mask(active_box_counts=active_box_counts, num_boxes=self.num_boxes)
 
         active_box_fraction = active_box_counts.to(dtype=points.dtype) / float(self.num_boxes)
-        active_box_mask = _sample_active_box_mask(active_box_counts=active_box_counts, num_boxes=self.num_boxes)
 
         point_feat = self.point_mlp(xyz)  # [B, N, F]
         global_feat = point_feat.max(dim=1).values  # [B, F]
