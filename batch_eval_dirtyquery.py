@@ -19,17 +19,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--query-file",
         type=str,
-        default="/TIEVNAS/jyf/KITTI/kitti_00_evaluation_query_th20m_yaw_1runs.pickle",
+        default="/TIEVNAS/jinyuanfeng/KITTI/kitti_00_evaluation_query_th20m_yaw_1runs.pickle",
     )
     parser.add_argument(
         "--db-file",
         type=str,
-        default="/TIEVNAS/jyf/KITTI/kitti_00_evaluation_database_th20m_yaw_1runs.pickle",
+        default="/TIEVNAS/jinyuanfeng/KITTI/kitti_00_evaluation_database_th20m_yaw_1runs.pickle",
     )
     parser.add_argument("--query-index", type=int, default=0)
     parser.add_argument("--db-index", type=int, default=0)
     parser.add_argument("--kitti-root", type=str, default="/TIEVNAS/KITTI")
-    parser.add_argument("--fallback-root", type=str, default="/TIEVNAS/jyf/KITTI")
+    parser.add_argument("--fallback-root", type=str, default="/TIEVNAS/jinyuanfeng/KITTI")
     parser.add_argument("--adv-checkpoint", type=str, required=True)
     parser.add_argument("--baseline-checkpoint", type=str, required=True)
     parser.add_argument(

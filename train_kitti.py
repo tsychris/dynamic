@@ -857,7 +857,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--query-file",
         type=str,
-        default="/TIEVNAS/jyf/KITTI/kitti_vxp_training_queries_baseline_p10_n25_yaw.pickle",
+        default="/TIEVNAS/jinyuanfeng/KITTI/kitti_vxp_training_queries_baseline_p10_n25_yaw.pickle",
     )
     parser.add_argument("--kitti-root", type=str, default="/TIEVNAS/KITTI")
     parser.add_argument("--fallback-root", type=str, default="/TIEVNAS/jyf/KITTI")
