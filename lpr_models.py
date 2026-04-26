@@ -247,6 +247,7 @@ class PointNetVLADDescriptor(nn.Module):
     ) -> None:
         super().__init__()
         self.num_points = num_points
+        self.output_dim = emb_dim
         self.point_net = PointNetFeat(
             num_points=num_points,
             global_feat=True,
@@ -276,6 +277,155 @@ class PointNetVLADDescriptor(nn.Module):
         return F.normalize(x, dim=-1)
 
 
+def _dgcnn_knn(x: torch.Tensor, k: int) -> torch.Tensor:
+    inner = -2.0 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x**2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+    return pairwise_distance.topk(k=k, dim=-1)[1]
+
+
+def _dgcnn_get_graph_feature(x: torch.Tensor, k: int, idx: torch.Tensor | None = None) -> torch.Tensor:
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+    if idx is None:
+        idx = _dgcnn_knn(x, k=k)
+
+    idx_base = torch.arange(batch_size, device=x.device).view(-1, 1, 1) * num_points
+    idx = (idx + idx_base).view(-1)
+
+    _, num_dims, _ = x.size()
+    x = x.transpose(2, 1).contiguous()
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).expand(-1, -1, k, -1)
+
+    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+    return feature
+
+
+class DGCNNFeatureExtractor(nn.Module):
+    """
+    DGCNN backbone that outputs per-point features for global aggregation.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        feature_dim: int = 1024,
+        k: int = 20,
+        negative_slope: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.feature_dim = feature_dim
+        self.k = k
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels * 2, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(64 + 64 + 128 + 256, feature_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(feature_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+        )
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        if points.ndim != 3:
+            raise ValueError(f"Expected input [B, N, C], got {tuple(points.shape)}")
+        if points.shape[-1] < self.in_channels:
+            raise ValueError(
+                f"DGCNNFeatureExtractor expects at least {self.in_channels} channels, got {points.shape[-1]}"
+            )
+
+        x = points[..., : self.in_channels].transpose(1, 2).contiguous()
+        num_points = x.shape[-1]
+        if num_points < 1:
+            raise ValueError("DGCNNFeatureExtractor received an empty point cloud.")
+        k = min(self.k, num_points)
+
+        x = _dgcnn_get_graph_feature(x, k=k)
+        x = self.conv1(x)
+        x1 = x.max(dim=-1, keepdim=False).values
+
+        x = _dgcnn_get_graph_feature(x1, k=k)
+        x = self.conv2(x)
+        x2 = x.max(dim=-1, keepdim=False).values
+
+        x = _dgcnn_get_graph_feature(x2, k=k)
+        x = self.conv3(x)
+        x3 = x.max(dim=-1, keepdim=False).values
+
+        x = _dgcnn_get_graph_feature(x3, k=k)
+        x = self.conv4(x)
+        x4 = x.max(dim=-1, keepdim=False).values
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        x = self.conv5(x)
+        return x.unsqueeze(-1)
+
+
+class DGCNNVLADDescriptor(nn.Module):
+    """
+    DGCNN backbone with NetVLAD global aggregation. Input is [B, N, C], output is [B, D].
+    """
+
+    def __init__(
+        self,
+        num_points: int = 4096,
+        emb_dim: int = 256,
+        in_channels: int = 3,
+        k: int = 20,
+        feature_dim: int = 1024,
+        cluster_size: int = 64,
+    ) -> None:
+        super().__init__()
+        self.num_points = num_points
+        self.output_dim = emb_dim
+        self.backbone = DGCNNFeatureExtractor(
+            in_channels=in_channels,
+            feature_dim=feature_dim,
+            k=k,
+        )
+        self.net_vlad = NetVLADLoupe(
+            feature_size=feature_dim,
+            max_samples=num_points,
+            cluster_size=cluster_size,
+            output_dim=emb_dim,
+            gating=True,
+            add_batch_norm=True,
+        )
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        if points.ndim != 3:
+            raise ValueError(f"Expected input [B, N, C], got {tuple(points.shape)}")
+        if points.shape[1] != self.num_points:
+            raise ValueError(
+                f"DGCNNVLAD expects exactly {self.num_points} points, got {points.shape[1]}"
+            )
+
+        x = self.backbone(points)
+        x = self.net_vlad(x)
+        return F.normalize(x, dim=-1)
+
+
 def build_descriptor_model(
     arch: str = "pointnetvlad",
     num_points: int = 4096,
@@ -287,6 +437,12 @@ def build_descriptor_model(
         return PointNetDescriptor(in_channels=in_channels, emb_dim=emb_dim)
     if arch == "pointnetvlad":
         return PointNetVLADDescriptor(num_points=num_points, emb_dim=emb_dim)
+    if arch in {"dgcnn_vlad", "dgcnnvlad"}:
+        return DGCNNVLADDescriptor(
+            num_points=num_points,
+            emb_dim=emb_dim,
+            in_channels=in_channels,
+        )
     raise ValueError(f"Unsupported descriptor arch: {arch}")
 
 

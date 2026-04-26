@@ -1,0 +1,194 @@
+\subsection{Adversarial Alternating Optimization}
+\label{sec:adv_alternating_training}
+
+Let $\mathbf{x}_i \in \mathbb{R}^{N \times C}$ denote the $i$-th point cloud in a mini-batch $\mathcal{B}$, and let
+$f_{\theta}(\cdot)$ be the place descriptor network parameterized by $\theta$. The adversarial occlusion generator
+$G_{\phi}(\cdot)$, parameterized by $\phi$, predicts a set of vehicle-like cuboids and applies a structured occlusion
+transform to the input point cloud. The overall objective is formulated as a min-max game:
+\begin{equation}
+\min_{\theta} \max_{\phi} \; \mathcal{L}_{\mathrm{place}}\!\left(f_{\theta}(T_{\phi}(\mathbf{x}))\right),
+\label{eq:minmax_objective}
+\end{equation}
+where $T_{\phi}(\cdot)$ denotes the occlusion transform induced by the generator. In practice, we optimize this
+objective by alternating between a generator update step and a descriptor update step in every training iteration.
+
+\paragraph{Batch-hard place recognition loss.}
+For each anchor $i$ in the mini-batch, let $\mathcal{P}(i)$ and $\mathcal{N}(i)$ denote the positive and negative
+index sets provided by the training tuple construction. Given embeddings $\mathbf{z}_i = f_{\theta}(\mathbf{x}_i)$,
+we define the Euclidean distance
+\begin{equation}
+d_{ij} = \left\lVert \mathbf{z}_i - \mathbf{z}_j \right\rVert_2.
+\end{equation}
+The batch-hard triplet loss is then written as
+\begin{equation}
+\mathcal{L}_{\mathrm{place}}
+=
+\frac{1}{|\mathcal{V}|}
+\sum_{i \in \mathcal{V}}
+\left[
+\max_{p \in \mathcal{P}(i)} d_{ip}
+-
+\min_{n \in \mathcal{N}(i)} d_{in}
++
+\delta
+\right]_+,
+\label{eq:batch_hard_triplet}
+\end{equation}
+where $\delta$ is the margin, $[\cdot]_+ = \max(\cdot, 0)$, and $\mathcal{V}$ is the set of valid anchors that have
+at least one positive and one negative sample within the current mini-batch.
+
+\paragraph{Generator parameterization and occlusion transform.}
+For each input point cloud, the generator predicts $M$ cuboids
+\begin{equation}
+G_{\phi}(\mathbf{x}_i)
+\rightarrow
+\left\{
+\left(\mathbf{c}_{i,m}, \mathbf{s}_{i,m}, \psi_{i,m}\right)
+\right\}_{m=1}^{M},
+\end{equation}
+where $\mathbf{c}_{i,m} \in \mathbb{R}^3$, $\mathbf{s}_{i,m} \in \mathbb{R}^3$, and $\psi_{i,m}$ denote the center,
+size, and yaw angle of the $m$-th cuboid, respectively. During training, an active-box count $k_i \in \{1,\dots,M\}$
+is randomly sampled for each sample, and exactly $k_i$ cuboids are activated to produce the occlusion pattern.
+
+The generator outputs both a differentiable soft mask and a hard binary mask. We therefore distinguish two occlusion
+operators:
+\begin{equation}
+\tilde{\mathbf{x}}^{\,s}_i = T_{\phi}^{\mathrm{soft}}(\mathbf{x}_i),
+\qquad
+\tilde{\mathbf{x}}^{\,h}_i = T_{\phi}^{\mathrm{hard}}(\mathbf{x}_i),
+\end{equation}
+where the soft transform is used for generator optimization, while the hard transform is used for descriptor
+optimization. The hard transform may additionally insert synthetic points on the surfaces of active cuboids to mimic
+dynamic object returns.
+
+\paragraph{Generator objective.}
+In the generator update step, the descriptor network is frozen and only $\phi$ is optimized. The generator aims to
+maximize the place recognition difficulty of the occluded point clouds while remaining geometrically plausible. The
+generator loss is defined as
+\begin{equation}
+\mathcal{L}_{G}
+=
+-\mathcal{L}_{\mathrm{place}}
+\left(
+\left\{
+f_{\theta}(\tilde{\mathbf{x}}^{\,s}_i)
+\right\}_{i \in \mathcal{B}}
+\right)
++
+\lambda_{\mathrm{size}} \mathcal{L}_{\mathrm{size}}
++
+\lambda_{\mathrm{height}} \mathcal{L}_{\mathrm{height}}
++
+\lambda_{\mathrm{range}} \mathcal{L}_{\mathrm{range}}.
+\label{eq:generator_loss}
+\end{equation}
+The negative sign makes the generator adversarial: minimizing $\mathcal{L}_{G}$ is equivalent to maximizing the place
+loss of the descriptor network on the occluded inputs.
+
+The regularization terms enforce simple geometric priors on the generated cuboids. Specifically,
+\begin{equation}
+\mathcal{L}_{\mathrm{size}}
+=
+\begin{cases}
+\mathrm{SmoothL1}\!\left(\mathbf{s}_{i,m}, \mathbf{s}_{\mathrm{car}}\right), & \text{if box sizes are learnable}, \\
+0, & \text{if fixed box sizes are used},
+\end{cases}
+\label{eq:size_prior}
+\end{equation}
+where $\mathbf{s}_{\mathrm{car}}$ is a nominal vehicle size prior. The height prior is
+\begin{equation}
+\mathcal{L}_{\mathrm{height}}
+=
+\frac{1}{BM}
+\sum_{i=1}^{B}
+\sum_{m=1}^{M}
+\left(c^{(z)}_{i,m} + 1.0\right)^2,
+\label{eq:height_prior}
+\end{equation}
+which encourages the cuboid centers to stay close to the drivable vertical band. The range prior is
+\begin{equation}
+\mathcal{L}_{\mathrm{range}}
+=
+\frac{1}{BM}
+\sum_{i=1}^{B}
+\sum_{m=1}^{M}
+\left[
+\max\!\left(
+0,
+\sqrt{\left(c^{(x)}_{i,m}\right)^2 + \left(c^{(y)}_{i,m}\right)^2} - 45.0
+\right)
+\right]^2,
+\label{eq:range_prior}
+\end{equation}
+which discourages the generator from placing cuboids at unrealistically large radial distances.
+
+\paragraph{Descriptor objective.}
+In the descriptor update step, the generator is frozen and the same sampled box-count budget is reused to produce a
+hard occluded point cloud for each sample. The descriptor is optimized jointly on clean and adversarial inputs:
+\begin{equation}
+\mathbf{z}^{\,c}_i = f_{\theta}(\mathbf{x}_i),
+\qquad
+\mathbf{z}^{\,a}_i = f_{\theta}(\tilde{\mathbf{x}}^{\,h}_i).
+\end{equation}
+The descriptor loss is defined as
+\begin{equation}
+\mathcal{L}_{F}
+=
+\mathcal{L}_{\mathrm{clean}}
++
+\lambda_{\mathrm{adv}} \mathcal{L}_{\mathrm{adv}}
++
+\lambda_{\mathrm{cons}} \mathcal{L}_{\mathrm{cons}},
+\label{eq:descriptor_loss}
+\end{equation}
+where
+\begin{align}
+\mathcal{L}_{\mathrm{clean}}
+&=
+\mathcal{L}_{\mathrm{place}}
+\left(
+\left\{
+f_{\theta}(\mathbf{x}_i)
+\right\}_{i \in \mathcal{B}}
+\right),
+\\
+\mathcal{L}_{\mathrm{adv}}
+&=
+\mathcal{L}_{\mathrm{place}}
+\left(
+\left\{
+f_{\theta}(\tilde{\mathbf{x}}^{\,h}_i)
+\right\}_{i \in \mathcal{B}}
+\right),
+\\
+\mathcal{L}_{\mathrm{cons}}
+&=
+\frac{1}{B}
+\sum_{i=1}^{B}
+\left(
+1 -
+\frac{
+\left\langle \mathbf{z}^{\,c}_i, \mathbf{z}^{\,a}_i \right\rangle
+}{
+\left\lVert \mathbf{z}^{\,c}_i \right\rVert_2
+\left\lVert \mathbf{z}^{\,a}_i \right\rVert_2
+}
+\right).
+\label{eq:consistency_loss}
+\end{align}
+Here, $\mathcal{L}_{\mathrm{clean}}$ preserves the nominal place-recognition capability on uncorrupted point clouds,
+$\mathcal{L}_{\mathrm{adv}}$ explicitly improves robustness under generated occlusion, and
+$\mathcal{L}_{\mathrm{cons}}$ constrains the clean and adversarial embeddings of the same scene to remain close in the
+descriptor space.
+
+\paragraph{Alternating optimization.}
+For each mini-batch, we perform the following two sub-steps:
+\begin{align}
+\phi &\leftarrow \phi - \eta_{G} \nabla_{\phi} \mathcal{L}_{G},
+\\
+\theta &\leftarrow \theta - \eta_{F} \nabla_{\theta} \mathcal{L}_{F},
+\end{align}
+where $\eta_{G}$ and $\eta_{F}$ are the learning rates of the generator and the descriptor network, respectively.
+This alternating strategy stabilizes the adversarial game: the generator continuously searches for geometrically
+plausible hard cases, while the descriptor network learns to preserve place-level discriminability under both clean and
+occluded observations.

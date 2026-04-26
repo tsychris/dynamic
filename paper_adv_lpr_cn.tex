@@ -1,0 +1,276 @@
+% !TEX program = xelatex
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage[top=2.5cm,bottom=2.5cm,left=3.0cm,right=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{setspace}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue
+}
+
+\captionsetup{font=small,labelfont=bf}
+\setstretch{1.35}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0pt}
+
+\ctexset{
+  section = {
+    format = \bfseries\zihao{4},
+    beforeskip = 1.2ex plus 0.5ex minus 0.2ex,
+    afterskip = 0.8ex plus 0.2ex
+  },
+  subsection = {
+    format = \bfseries\zihao{-4},
+    beforeskip = 1.0ex plus 0.3ex minus 0.2ex,
+    afterskip = 0.6ex plus 0.2ex
+  },
+  subsubsection = {
+    format = \bfseries\zihao{5},
+    beforeskip = 0.8ex plus 0.2ex minus 0.2ex,
+    afterskip = 0.5ex plus 0.2ex
+  }
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert_2}
+\newcommand{\inner}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\relu}[1]{\left[#1\right]_+}
+\newcommand{\setc}[1]{\left\{#1\right\}}
+
+\title{\zihao{2}\bfseries 面向动态遮挡鲁棒性的激光雷达位置识别\\对抗式训练方法}
+\author{\zihao{4} 作者姓名\\[0.2em]\zihao{-4} （单位名称，城市，邮编）}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+针对激光雷达位置识别任务中动态车辆、行人等遮挡因素导致的全局描述符退化问题，本文提出一种面向结构化动态遮挡的对抗式训练方法。该方法以点云位置识别网络为主体，在训练阶段引入动态遮挡生成器，由生成器根据输入点云预测若干具有车辆形态先验的三维长方体遮挡体，并通过点删除或物体插入的方式构造结构化扰动样本。在优化过程中，生成器以最大化位置识别损失为目标，描述符网络则同时在干净样本与受扰样本上进行监督学习，并引入表示一致性约束，从而形成稳定的交替优化训练框架。相较于随机点丢弃策略，本文方法生成的扰动更符合真实动态场景中的遮挡模式，可用于提升位置识别模型在复杂交通环境中的鲁棒性与泛化能力。
+\end{abstract}
+
+\noindent\textbf{关键词：} 激光雷达位置识别；动态遮挡；对抗训练；全局描述符；点云鲁棒性
+
+\section{引言}
+激光雷达位置识别（LiDAR Place Recognition, LPR）的核心任务是从大规模点云地图中检索与当前观测对应的历史位置。现有方法通常通过描述符网络将输入点云映射为全局特征向量，再依据特征距离完成相似场景检索。然而，在真实自动驾驶场景中，车辆、行人以及其他临时障碍物会对点云观测造成明显遮挡，使得同一地点在不同时间获得的点云存在较强结构差异，进而降低位置识别模型的稳定性。
+
+一种直接的增强思路是在训练阶段对输入点云施加随机丢点扰动，但随机扰动难以反映动态目标的几何结构与空间分布特征，因而与真实遮挡存在差异。基于此，本文考虑利用生成模型主动构造结构化动态遮挡，使模型在训练过程中见到更接近实际场景的困难样本，从而提升描述符的动态鲁棒性。
+
+本文提出一种对抗式动态遮挡训练框架。该框架由描述符网络与遮挡生成器组成：前者负责提取位置识别描述符，后者负责依据输入点云生成结构化遮挡模式；二者通过极小极大目标进行交替优化。本文方法的特点在于：1）遮挡扰动以车辆形态先验为约束，几何形式更接近真实动态物体；2）通过软遮挡与硬遮挡的分阶段设计兼顾可导性与物理合理性；3）通过干净样本损失、对抗样本损失及一致性损失的联合约束，保证模型在保持原始识别能力的同时增强遮挡鲁棒性。
+
+\section{方法}
+
+\subsection{问题定义}
+设训练批次为
+\begin{equation}
+\mathcal{B}=\setc{\bm{x}_i}_{i=1}^{B},
+\end{equation}
+其中，$\bm{x}_i\in\R^{N\times C}$ 表示第 $i$ 个点云样本，$N$ 为点数，$C$ 为每个点的特征维度。记描述符网络为 $f_{\theta}(\cdot)$，其参数为 $\theta$；记动态遮挡生成器为 $G_{\phi}(\cdot)$，其参数为 $\phi$。本文目标可形式化为如下极小极大问题：
+\begin{equation}
+\min_{\theta}\max_{\phi}\ \mathcal{L}_{\mathrm{place}}\!\left(f_{\theta}\!\left(T_{\phi}(\bm{x})\right)\right),
+\label{eq:minmax}
+\end{equation}
+其中，$T_{\phi}(\cdot)$ 表示由生成器参数化的遮挡变换，$\mathcal{L}_{\mathrm{place}}$ 表示位置识别损失函数。
+
+\subsection{位置识别描述符学习}
+对于输入点云 $\bm{x}_i$，描述符网络输出其全局嵌入表示
+\begin{equation}
+\bm{z}_i=f_{\theta}(\bm{x}_i)\in\R^{D},
+\end{equation}
+其中，$D$ 为描述符维度。为度量样本间差异，定义嵌入空间中的欧氏距离为
+\begin{equation}
+d_{ij}=\norm{\bm{z}_i-\bm{z}_j}.
+\label{eq:pairwise_distance}
+\end{equation}
+
+记锚样本 $i$ 的正样本集合与负样本集合分别为 $\mathcal{P}(i)$ 和 $\mathcal{N}(i)$。本文采用批次内困难三元组损失作为基础位置识别损失，即
+\begin{equation}
+\mathcal{L}_{\mathrm{place}}
+=
+\frac{1}{|\mathcal{V}|}
+\sum_{i\in\mathcal{V}}
+\relu{
+\max_{p\in\mathcal{P}(i)} d_{ip}
+-
+\min_{n\in\mathcal{N}(i)} d_{in}
++ \delta
+},
+\label{eq:place_loss}
+\end{equation}
+其中，$\delta$ 为间隔超参数，$\mathcal{V}$ 为当前批次中同时具有正样本与负样本的有效锚样本集合。
+
+\subsection{动态遮挡生成器}
+对于输入点云 $\bm{x}_i$，生成器预测 $M$ 个候选遮挡体参数：
+\begin{equation}
+G_{\phi}(\bm{x}_i)\rightarrow
+\setc{
+\left(\bm{c}_{i,m},\bm{s}_{i,m},\psi_{i,m}\right)
+}_{m=1}^{M},
+\label{eq:generator_output}
+\end{equation}
+其中，$\bm{c}_{i,m}\in\R^{3}$、$\bm{s}_{i,m}\in\R^{3}$ 和 $\psi_{i,m}$ 分别表示第 $m$ 个长方体遮挡体的中心坐标、尺寸参数及偏航角。每个遮挡体对应一种近似车辆形态的几何先验。
+
+在训练阶段，对每个样本随机采样一个激活遮挡体数量 $k_i\in\{1,\dots,M\}$，仅保留其中 $k_i$ 个遮挡体参与当前前向过程，以形成不同强度的遮挡扰动。考虑到生成器训练需要可导路径，而描述符网络训练更强调物理一致性，本文定义两类扰动结果：
+\begin{equation}
+\tilde{\bm{x}}^{\,s}_i=T^{\mathrm{soft}}_{\phi}(\bm{x}_i),\qquad
+\tilde{\bm{x}}^{\,h}_i=T^{\mathrm{hard}}_{\phi}(\bm{x}_i).
+\label{eq:soft_hard}
+\end{equation}
+其中，$T^{\mathrm{soft}}_{\phi}$ 表示软遮挡变换，用于生成器更新阶段；$T^{\mathrm{hard}}_{\phi}$ 表示硬遮挡变换，用于描述符网络更新阶段。若启用物体插入机制，则可在硬遮挡阶段于长方体表面采样插入点，以模拟动态车辆带来的激光回波。
+
+\subsection{生成器损失函数}
+在生成器更新阶段，固定描述符网络参数 $\theta$，仅优化生成器参数 $\phi$。此时生成器的目标是在几何合理性约束下，尽可能增大描述符网络在受扰样本上的位置识别损失。因此生成器损失定义为
+\begin{equation}
+\mathcal{L}_{G}
+=
+-\mathcal{L}_{\mathrm{place}}
+\left(
+\setc{
+f_{\theta}\!\left(\tilde{\bm{x}}^{\,s}_i\right)
+}_{i\in\mathcal{B}}
+\right)
++
+\lambda_{\mathrm{size}}\mathcal{L}_{\mathrm{size}}
++
+\lambda_{\mathrm{height}}\mathcal{L}_{\mathrm{height}}
++
+\lambda_{\mathrm{range}}\mathcal{L}_{\mathrm{range}}.
+\label{eq:loss_g}
+\end{equation}
+
+式中，第一项前的负号表示最小化 $\mathcal{L}_{G}$ 等价于最大化对抗扰动下的位置识别损失。后三项用于限制遮挡体的几何分布，避免生成器退化为不合理的攻击模式。
+
+尺寸先验用于约束遮挡体接近典型车辆尺寸 $\bm{s}_{\mathrm{car}}$：
+\begin{equation}
+\mathcal{L}_{\mathrm{size}}
+=
+\frac{1}{BM}
+\sum_{i=1}^{B}\sum_{m=1}^{M}
+\mathrm{SmoothL1}\!\left(\bm{s}_{i,m},\bm{s}_{\mathrm{car}}\right).
+\label{eq:size_prior}
+\end{equation}
+
+高度先验用于约束遮挡体中心靠近地面区域：
+\begin{equation}
+\mathcal{L}_{\mathrm{height}}
+=
+\frac{1}{BM}
+\sum_{i=1}^{B}\sum_{m=1}^{M}
+\left(c_{i,m}^{(z)}-z_{0}\right)^{2},
+\label{eq:height_prior}
+\end{equation}
+其中，$z_{0}$ 为预设地面附近的高度先验中心。
+
+距离先验用于限制遮挡体分布在激光雷达有效感知范围内：
+\begin{equation}
+\mathcal{L}_{\mathrm{range}}
+=
+\frac{1}{BM}
+\sum_{i=1}^{B}\sum_{m=1}^{M}
+\left[
+\max\!\left(
+0,\sqrt{\left(c_{i,m}^{(x)}\right)^{2}+\left(c_{i,m}^{(y)}\right)^{2}}-r_{\max}
+\right)
+\right]^{2},
+\label{eq:range_prior}
+\end{equation}
+其中，$r_{\max}$ 表示允许的最大水平距离阈值。
+
+\subsection{描述符网络损失函数}
+在描述符网络更新阶段，固定生成器参数 $\phi$，利用当前生成器输出构造硬遮挡点云，并分别计算干净样本与受扰样本的描述符：
+\begin{equation}
+\bm{z}^{\,c}_i=f_{\theta}(\bm{x}_i),\qquad
+\bm{z}^{\,a}_i=f_{\theta}\!\left(\tilde{\bm{x}}^{\,h}_i\right).
+\label{eq:clean_adv_embed}
+\end{equation}
+
+描述符网络总损失定义为
+\begin{equation}
+\mathcal{L}_{F}
+=
+\mathcal{L}_{\mathrm{clean}}
++
+\lambda_{\mathrm{adv}}\mathcal{L}_{\mathrm{adv}}
++
+\lambda_{\mathrm{cons}}\mathcal{L}_{\mathrm{cons}},
+\label{eq:loss_f}
+\end{equation}
+其中，
+\begin{align}
+\mathcal{L}_{\mathrm{clean}}
+&=
+\mathcal{L}_{\mathrm{place}}
+\left(
+\setc{
+f_{\theta}(\bm{x}_i)
+}_{i\in\mathcal{B}}
+\right),
+\label{eq:loss_clean}
+\\
+\mathcal{L}_{\mathrm{adv}}
+&=
+\mathcal{L}_{\mathrm{place}}
+\left(
+\setc{
+f_{\theta}\!\left(\tilde{\bm{x}}^{\,h}_i\right)
+}_{i\in\mathcal{B}}
+\right).
+\label{eq:loss_adv}
+\end{align}
+
+为约束同一场景在干净观测与遮挡观测下的全局表示保持一致，引入余弦一致性损失：
+\begin{equation}
+\mathcal{L}_{\mathrm{cons}}
+=
+\frac{1}{B}
+\sum_{i=1}^{B}
+\left(
+1-
+\frac{\inner{\bm{z}^{\,c}_i}{\bm{z}^{\,a}_i}}
+{\norm{\bm{z}^{\,c}_i}\norm{\bm{z}^{\,a}_i}}
+\right).
+\label{eq:loss_cons}
+\end{equation}
+
+其中，$\mathcal{L}_{\mathrm{clean}}$ 用于保持模型在原始点云上的检索性能，$\mathcal{L}_{\mathrm{adv}}$ 用于提升模型对结构化遮挡扰动的识别能力，$\mathcal{L}_{\mathrm{cons}}$ 则用于抑制同一地点在两种观测条件下的表示漂移。
+
+\subsection{交替优化训练策略}
+本文采用逐批次交替优化策略。在每次迭代中，首先固定描述符网络并更新生成器：
+\begin{equation}
+\phi \leftarrow \phi-\eta_{G}\nabla_{\phi}\mathcal{L}_{G},
+\label{eq:update_g}
+\end{equation}
+随后固定生成器并更新描述符网络：
+\begin{equation}
+\theta \leftarrow \theta-\eta_{F}\nabla_{\theta}\mathcal{L}_{F}.
+\label{eq:update_f}
+\end{equation}
+其中，$\eta_{G}$ 和 $\eta_{F}$ 分别为生成器与描述符网络的学习率。
+
+该训练过程本质上构成一个稳定化的对抗博弈。生成器持续搜索更具破坏性的结构化遮挡模式，描述符网络则在干净监督、对抗监督与一致性约束的共同作用下，逐步学习动态场景下更鲁棒的全局表示。相较于单纯随机丢点增强，本文方法能够更有效地逼近真实动态遮挡分布，因此更适合用于面向实际道路场景的激光雷达位置识别训练。
+
+\section{实验设置}
+\subsection{数据集与预处理}
+实验可基于 KITTI 数据集构建训练集、数据库集与查询集。对于每帧激光雷达点云，首先读取原始三维点坐标，并根据网络输入规模进行随机采样或截断，以获得固定点数的输入。若描述符网络采用 PointNetVLAD 或 DGCNN+NetVLAD 结构，则直接使用点集输入；若后续扩展至其他骨干网络，则需依据其输入形式执行相应预处理。
+
+\subsection{评价指标}
+本文采用召回率（Recall）作为主要评价指标。对于每个查询样本，在数据库中检索其最近邻结果，若前 $K$ 个结果中至少包含一个真实匹配样本，则记为 Recall@$K$ 命中。实验中通常报告 Recall@1、Recall@5、Recall@10 以及 Recall@1\% 等指标，以全面反映模型的检索性能与鲁棒性。
+
+\subsection{对比设置}
+为验证本文方法的有效性，可设置如下对比组：1）仅使用原始描述符网络进行训练的基线模型；2）采用随机丢点增强的模型；3）采用本文所提对抗式结构化遮挡训练策略的模型。在测试阶段，可分别构造 clean query--clean db、dirty query--clean db 以及 dirty query--dirty db 等不同评价场景，以分析模型对动态遮挡扰动的适应能力。
+
+\section{结论}
+本文围绕动态场景下的激光雷达位置识别问题，提出了一种基于结构化遮挡生成器的对抗式训练方法。该方法通过显式建模车辆形态遮挡，并以交替优化方式联合训练遮挡生成器与描述符网络，使位置识别模型能够在保持干净样本性能的同时提升对动态障碍物干扰的鲁棒性。后续工作可进一步结合更细粒度的场景条件建模、多模态语义先验以及真实动态轨迹约束，以增强生成遮挡的场景自适应性与物理真实性。
+
+\end{document}
